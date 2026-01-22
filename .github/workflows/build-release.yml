@@ -1,27 +1,139 @@
-- name: Download & Extract SDK
-  run: |
-    cd ~/cache/sdk
+name: Build and Release
 
-    URL="${{ matrix.sdk_url_path%/ }}/sha256sums"
-    echo "Using URL: $URL"
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
 
-    wget "$URL"
+env:
+  PACKAGE_NAME: luci-app-xray
 
-    SDK_FILE=$(grep "${{ matrix.sdk_name }}" sha256sums | awk '{print $2}' | sed 's/*//')
-    if [ -z "$SDK_FILE" ]; then
-      echo "::error::SDK not found! Check sdk_name in matrix."
-      exit 1
-    fi
+jobs:
+  build:
+    name: Build luci-app-xray — ${{ matrix.arch }}
+    runs-on: ubuntu-latest
 
-    if [ ! -f "$SDK_FILE" ]; then
-      wget "${{ matrix.sdk_url_path%/ }}/$SDK_FILE"
-    fi
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: mediatek_filogic
+            sdk_url_path: https://downloads.openwrt.org/releases/24.10.5/targets/mediatek/filogic/
+            sdk_name: openwrt-sdk-24.10.5-mediatek-filogic_gcc-13.3.0_musl.Linux-x86_64.tar.zst
 
-    sha256sum -c sha256sums --ignore-missing || exit 1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    mkdir -p "$SDK_HOME"
-    if [[ "$SDK_FILE" == *.zst ]]; then
-      zstd -d "$SDK_FILE" --stdout | tar -xf - -C "$SDK_HOME" --strip-components=1
-    else
-      7z x "$SDK_FILE" -so | tar -xf - -C "$SDK_HOME" --strip-components=1
-    fi
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc || true
+
+      - name: Cache dl + feeds + ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/cache/dl
+            ~/cache/feeds
+            ~/.ccache
+          key: cache-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: |
+            cache-${{ matrix.arch }}-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache zstd wget p7zip-full
+
+      - name: Prepare directories
+        run: |
+          mkdir -p ~/cache/dl ~/cache/feeds ~/cache/sdk
+          echo "SDK_HOME=$(mktemp -d)" >> $GITHUB_ENV
+
+      - name: Download & Extract OpenWrt SDK
+        run: |
+          set -e
+          cd ~/cache/sdk
+
+          BASE_URL="${{ matrix.sdk_url_path%/ }}"
+          SHA_URL="$BASE_URL/sha256sums"
+
+          echo "Downloading sha256sums from $SHA_URL"
+          wget -q "$SHA_URL"
+
+          SDK_FILE=$(grep "${{ matrix.sdk_name }}" sha256sums | awk '{print $2}' | sed 's/*//')
+          if [ -z "$SDK_FILE" ]; then
+            echo "::error::SDK not found in sha256sums"
+            exit 1
+          fi
+
+          if [ ! -f "$SDK_FILE" ]; then
+            echo "Downloading $SDK_FILE"
+            wget "$BASE_URL/$SDK_FILE"
+          fi
+
+          sha256sum -c sha256sums --ignore-missing
+
+          echo "Extracting SDK to $SDK_HOME"
+          mkdir -p "$SDK_HOME"
+
+          if [[ "$SDK_FILE" == *.zst ]]; then
+            zstd -d "$SDK_FILE" --stdout | tar -xf - -C "$SDK_HOME" --strip-components=1
+          else
+            7z x "$SDK_FILE" -so | tar -xf - -C "$SDK_HOME" --strip-components=1
+          fi
+
+      - name: Setup SDK (feeds + package link)
+        run: |
+          cd "$SDK_HOME"
+
+          rm -rf dl feeds
+          ln -s ~/cache/dl dl
+          ln -s ~/cache/feeds feeds
+
+          cp feeds.conf.default feeds.conf
+          sed -i 's#git.openwrt.org/openwrt/openwrt#github.com/openwrt/openwrt#' feeds.conf
+          sed -i 's#git.openwrt.org/feed/packages#github.com/openwrt/packages#' feeds.conf
+          sed -i 's#git.openwrt.org/project/luci#github.com/openwrt/luci#' feeds.conf
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -p luci
+
+          mkdir -p package/$PACKAGE_NAME
+          ln -sf "${{ github.workspace }}" package/$PACKAGE_NAME
+
+      - name: Build luci-app-xray
+        run: |
+          cd "$SDK_HOME"
+
+          echo 'CONFIG_CCACHE=y' >> .config
+          echo 'CONFIG_CCACHE_DIR="$HOME/.ccache"' >> .config
+          make defconfig
+
+          make package/luci-app-xray/clean V=s
+          make package/luci-app-xray/compile V=s -j$(nproc) || \
+            make package/luci-app-xray/compile V=s -j1
+
+          make package/luci-app-xray/install V=s
+
+          find bin/packages -name "*luci-app-xray*.ipk" -ls
+
+      - name: Copy .ipk to workspace
+        run: |
+          cp "$SDK_HOME"/bin/packages/*/luci/*luci-app-xray*.ipk . || true
+          ls -lh *.ipk
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: luci-app-xray_*.ipk
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-xray-${{ matrix.arch }}
+          path: luci-app-xray_*.ipk
